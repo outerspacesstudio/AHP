@@ -13,8 +13,18 @@ at that table (no mapping or alternatives-scoring functionality).
 npm install
 npm run dev        # local dev server
 npm run build      # production build
-node tests/ahp.test.mjs   # math validation suite
+node tests/ahp.test.mjs       # math validation suite
+node tests/project.test.mjs   # save/load + sample-project validation
 ```
+
+## Project files & sample data
+
+The header toolbar can **Export** the full project state (domains, criteria,
+thresholds, colors, all comparisons, lenses, mapping) to a versioned JSON
+file, **Import** such a file back (with validation and safe repair of
+out-of-range values), and **Load sample project** — a built-in, fully
+populated generic dataset (every matrix within the CR threshold) for demos.
+App state is otherwise in-memory only and resets on reload.
 
 ## Method notes
 
@@ -57,16 +67,28 @@ to "equal importance."
   advises re-running the leadership comparison after removing or mapping it).
 - Geometric-mean weights are an approximation of the principal eigenvector
   (they diverge slightly on inconsistent matrices; exact on consistent ones).
-- State is in-memory only and resets on reload — no persistence, sessions,
-  multi-user elicitation, or audit trail.
-- Thresholds are two breakpoints on a fixed shared 1–10 scale; no
-  per-criterion units, direction (benefit vs. cost), or value functions.
+- State is in-memory unless explicitly exported to a project file — no
+  autosave, sessions, multi-user elicitation, or audit trail.
+- Thresholds are three breakpoints (Low/Med, Med/High, High upper boundary)
+  on a fixed shared 1–10 scale; values above the High upper boundary are
+  simply capped at High. No per-criterion units, direction (benefit vs.
+  cost), or value functions.
 
 ## Output table
 
 Domain | Criterion | Domain-Internal Weight | Mapped Lens | Lens Weight |
 Composite (raw) | Composite (normalized) | Low/Med Threshold | Med/High
-Threshold — sortable by any column (defaults to normalized composite,
-descending), copyable as TSV and downloadable as CSV. Raw composite =
-domain-internal weight × mapped lens weight; normalized composite = raw ÷ sum
-of all raw composites (sums to 1 across the full criteria set).
+Threshold | High Upper Boundary — sortable by any column (defaults to
+normalized composite, descending), columns resizable by dragging header
+edges (double-click to reset), copyable as TSV and downloadable as CSV. Raw
+composite = domain-internal weight × mapped lens weight; normalized composite
+= raw ÷ sum of all raw composites (sums to 1 across the full criteria set).
+
+## Domain colors
+
+Each domain carries a color chosen in Step 1 from 10 fixed swatches and shown
+on every later screen, in the results table, and as the bar colors in the
+ranked chart (with a domain legend). The 10-swatch ordering was validated as
+a set for color-vision-deficiency separation (worst adjacent pair ΔE 24.2
+under protan simulation); domain identity is never conveyed by color alone —
+the domain name always accompanies the swatch.

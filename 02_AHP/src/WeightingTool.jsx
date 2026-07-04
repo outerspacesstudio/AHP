@@ -3,19 +3,21 @@
 // Three-stage architecture:
 //   1. Domain tier    — per-domain pairwise comparison of criteria + L/M/H
 //                       threshold calibration on a shared 1–10 scale.
-//   2. Mapping        — each domain is assigned to exactly one board-level lens.
+//   2. Mapping        — each domain is assigned to exactly one lens.
 //   3. Leadership tier — pairwise comparison of the lenses themselves.
 // Output: composite weight per criterion (domain-internal × lens weight),
 // raw and normalized, plus L/M/H threshold breakpoints, as an exportable table.
 //
 // Weights use the geometric-mean approximation of the principal eigenvector
 // (see src/ahp.js); consistency is checked independently per matrix.
+// Project state (src/project.js) can be exported to / imported from JSON.
 
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   ResponsiveContainer,
   BarChart,
   Bar,
+  Cell,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -30,21 +32,18 @@ import {
   computeComposites,
   worstComparisons,
 } from './ahp.js';
+import {
+  DOMAIN_COLORS,
+  makeCriterion,
+  makeDomain,
+  makeLens,
+  nextColor,
+  serializeProject,
+  parseProject,
+  sampleProject,
+} from './project.js';
 
 /* ---------------------------------------------------------------- helpers */
-
-let uidCounter = 0;
-const newId = (prefix) =>
-  `${prefix}${(++uidCounter).toString(36).padStart(6, '0')}`;
-
-const makeCriterion = (name) => ({ id: newId('c'), name, lowMed: 4, medHigh: 7 });
-const makeDomain = (name, criterionNames) => ({
-  id: newId('d'),
-  name,
-  criteria: criterionNames.map(makeCriterion),
-  comparisons: {},
-});
-const makeLens = (name) => ({ id: newId('l'), name });
 
 const INTENSITY_WORDS = {
   1: 'equal importance',
@@ -65,16 +64,22 @@ function formatSaaty(v) {
 
 const fmt = (v, digits = 4) => (v === undefined ? '—' : v.toFixed(digits));
 const pct = (v) => (v === undefined ? '—' : `${(v * 100).toFixed(1)}%`);
+const clampNum = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function Dot({ color }) {
+  return <span className="dot" style={{ background: color }} aria-hidden="true" />;
+}
 
 /* ------------------------------------------------------------ initial data */
 
 function initialState() {
-  const domains = [
-    makeDomain('Domain 1', ['Site Factor 1A', 'Site Factor 1B', 'Site Factor 1C']),
-    makeDomain('Domain 2', ['Site Factor 2A', 'Site Factor 2B', 'Site Factor 2C']),
-    makeDomain('Domain 3', ['Site Factor 3A', 'Site Factor 3B']),
-    makeDomain('Domain 4', ['Site Factor 4A', 'Site Factor 4B', 'Site Factor 4C']),
-  ];
+  const domains = [];
+  domains.push(
+    makeDomain('Domain 1', ['Site Factor 1A', 'Site Factor 1B', 'Site Factor 1C'], DOMAIN_COLORS[0].hex),
+    makeDomain('Domain 2', ['Site Factor 2A', 'Site Factor 2B', 'Site Factor 2C'], DOMAIN_COLORS[1].hex),
+    makeDomain('Domain 3', ['Site Factor 3A', 'Site Factor 3B'], DOMAIN_COLORS[2].hex),
+    makeDomain('Domain 4', ['Site Factor 4A', 'Site Factor 4B', 'Site Factor 4C'], DOMAIN_COLORS[3].hex),
+  );
   const lenses = [
     makeLens('Priority Group 1'),
     makeLens('Priority Group 2'),
@@ -85,7 +90,7 @@ function initialState() {
   domains.forEach((d, i) => {
     mapping[d.id] = lenses[i % lenses.length].id;
   });
-  return { domains, lenses, mapping };
+  return { domains, lenses, mapping, lensComparisons: {} };
 }
 
 /* ------------------------------------------------------- pairwise controls */
@@ -201,17 +206,21 @@ function ConsistencyPanel({ tier, analysis, matrix, items }) {
 /* ------------------------------------------------------- threshold slider */
 
 function ThresholdSlider({ criterion, onChange }) {
-  const { lowMed, medHigh } = criterion;
+  const { lowMed, medHigh, high } = criterion;
   const toPct = (v) => ((v - 1) / 9) * 100;
-  const setLowMed = (v) => onChange(Math.min(Math.max(1, v), medHigh), medHigh);
-  const setMedHigh = (v) => onChange(lowMed, Math.max(Math.min(10, v), lowMed));
+  // Per-handle clamps: handles can never cross or invert.
+  const setLowMed = (v) => onChange(clampNum(v, 1, medHigh), medHigh, high);
+  const setMedHigh = (v) => onChange(lowMed, clampNum(v, lowMed, high), high);
+  const setHigh = (v) => onChange(lowMed, medHigh, clampNum(v, medHigh, 10));
+  const capped = high < 10;
   return (
     <div className="threshold-block">
       <div className="threshold-head">
         <span className="threshold-name">{criterion.name}</span>
         <span className="threshold-readout">
           Low 1.0–{lowMed.toFixed(1)} · Medium {lowMed.toFixed(1)}–{medHigh.toFixed(1)} ·
-          High {medHigh.toFixed(1)}–10.0
+          High {medHigh.toFixed(1)}–{high.toFixed(1)}
+          {capped && ` · above ${high.toFixed(1)} caps at High`}
         </span>
       </div>
       <div className="dual-slider">
@@ -222,9 +231,14 @@ function ThresholdSlider({ criterion, onChange }) {
           <div className="band-med" style={{ width: `${toPct(medHigh) - toPct(lowMed)}%` }}>
             {toPct(medHigh) - toPct(lowMed) > 12 && <span>Medium</span>}
           </div>
-          <div className="band-high" style={{ width: `${100 - toPct(medHigh)}%` }}>
-            {100 - toPct(medHigh) > 12 && <span>High</span>}
+          <div className="band-high" style={{ width: `${toPct(high) - toPct(medHigh)}%` }}>
+            {toPct(high) - toPct(medHigh) > 12 && <span>High</span>}
           </div>
+          {capped && (
+            <div className="band-cap" style={{ width: `${100 - toPct(high)}%` }}>
+              {100 - toPct(high) > 16 && <span>caps at High</span>}
+            </div>
+          )}
         </div>
         <input
           type="range"
@@ -232,7 +246,7 @@ function ThresholdSlider({ criterion, onChange }) {
           max="10"
           step="0.5"
           value={lowMed}
-          style={{ zIndex: lowMed > 7 ? 5 : 3 }}
+          style={{ zIndex: lowMed > 7 ? 7 : 3 }}
           aria-label={`${criterion.name}: Low/Medium boundary`}
           onChange={(e) => setLowMed(Number(e.target.value))}
         />
@@ -245,6 +259,16 @@ function ThresholdSlider({ criterion, onChange }) {
           style={{ zIndex: 4 }}
           aria-label={`${criterion.name}: Medium/High boundary`}
           onChange={(e) => setMedHigh(Number(e.target.value))}
+        />
+        <input
+          type="range"
+          min="1"
+          max="10"
+          step="0.5"
+          value={high}
+          style={{ zIndex: 5 }}
+          aria-label={`${criterion.name}: High upper boundary`}
+          onChange={(e) => setHigh(Number(e.target.value))}
         />
       </div>
       <div className="threshold-inputs">
@@ -270,6 +294,17 @@ function ThresholdSlider({ criterion, onChange }) {
             onChange={(e) => setMedHigh(Number(e.target.value))}
           />
         </label>
+        <label>
+          High upper boundary
+          <input
+            type="number"
+            min="1"
+            max="10"
+            step="0.5"
+            value={high}
+            onChange={(e) => setHigh(Number(e.target.value))}
+          />
+        </label>
       </div>
     </div>
   );
@@ -279,10 +314,11 @@ function ThresholdSlider({ criterion, onChange }) {
 
 function DefineStep({ domains, setDomains, mapping, setMapping, lenses }) {
   const addDomain = () => {
-    const d = makeDomain(`Domain ${domains.length + 1}`, [
-      'New Factor A',
-      'New Factor B',
-    ]);
+    const d = makeDomain(
+      `Domain ${domains.length + 1}`,
+      ['New Factor A', 'New Factor B'],
+      nextColor(domains),
+    );
     setDomains([...domains, d]);
     if (lenses.length > 0) {
       setMapping({ ...mapping, [d.id]: lenses[0].id });
@@ -294,8 +330,8 @@ function DefineStep({ domains, setDomains, mapping, setMapping, lenses }) {
     delete next[id];
     setMapping(next);
   };
-  const renameDomain = (id, name) =>
-    setDomains(domains.map((d) => (d.id === id ? { ...d, name } : d)));
+  const patchDomain = (id, patch) =>
+    setDomains(domains.map((d) => (d.id === id ? { ...d, ...patch } : d)));
   const addCriterion = (domainId) =>
     setDomains(
       domains.map((d) =>
@@ -337,22 +373,37 @@ function DefineStep({ domains, setDomains, mapping, setMapping, lenses }) {
       <h2>1 · Define Domains &amp; Criteria</h2>
       <p className="step-note">
         Each domain represents one independent subject-matter team. Add the
-        criteria (2–6 recommended) that team will weigh against each other.
-        Comparisons never cross domain boundaries.
+        criteria (2–6 recommended) that team will weigh against each other, and
+        pick a color — it identifies the domain on every later screen and in
+        the results table.
       </p>
       <div className="card-grid">
         {domains.map((d) => (
-          <div className="card" key={d.id}>
+          <div className="card domain-card" key={d.id} style={{ borderTopColor: d.color }}>
             <div className="card-head">
               <input
                 className="name-input domain-name"
                 aria-label="Domain name"
                 value={d.name}
-                onChange={(e) => renameDomain(d.id, e.target.value)}
+                onChange={(e) => patchDomain(d.id, { name: e.target.value })}
               />
               <button className="btn-ghost" onClick={() => removeDomain(d.id)}>
                 Remove domain
               </button>
+            </div>
+            <div className="swatch-row" role="radiogroup" aria-label={`Color for ${d.name}`}>
+              {DOMAIN_COLORS.map((c) => (
+                <button
+                  key={c.hex}
+                  type="button"
+                  role="radio"
+                  aria-checked={d.color === c.hex}
+                  aria-label={`${c.name} color`}
+                  className={`swatch ${d.color === c.hex ? 'selected' : ''}`}
+                  style={{ background: c.hex }}
+                  onClick={() => patchDomain(d.id, { color: c.hex })}
+                />
+              ))}
             </div>
             {d.criteria.length < 2 && (
               <p className="inline-note">
@@ -399,7 +450,7 @@ function DefineStep({ domains, setDomains, mapping, setMapping, lenses }) {
 
 /* -------------------------------------------------------------- step 2 UI */
 
-function DomainComparisonStep({ domains, setDomains }) {
+function CriteriaComparisonStep({ domains, setDomains }) {
   const setDomainComparison = (domainId, idA, idB, value) =>
     setDomains(
       domains.map((d) =>
@@ -408,14 +459,14 @@ function DomainComparisonStep({ domains, setDomains }) {
           : d,
       ),
     );
-  const setThresholds = (domainId, criterionId, lowMed, medHigh) =>
+  const setThresholds = (domainId, criterionId, lowMed, medHigh, high) =>
     setDomains(
       domains.map((d) =>
         d.id === domainId
           ? {
               ...d,
               criteria: d.criteria.map((c) =>
-                c.id === criterionId ? { ...c, lowMed, medHigh } : c,
+                c.id === criterionId ? { ...c, lowMed, medHigh, high } : c,
               ),
             }
           : d,
@@ -424,20 +475,24 @@ function DomainComparisonStep({ domains, setDomains }) {
 
   return (
     <section>
-      <h2>2 · Domain Pairwise Comparison &amp; Threshold Calibration</h2>
+      <h2>2 · Criteria Comparison &amp; Threshold Calibration</h2>
       <p className="step-note">
         Each domain team compares its own criteria on the 1–9 scale, then sets
-        Low/Medium and Medium/High breakpoints for every criterion on the shared
-        1–10 scale. Each domain's consistency ratio is computed independently —
-        no other domain's data can affect it.
+        Low/Medium, Medium/High, and High upper boundaries for every criterion
+        on the shared 1–10 scale (values above the High upper boundary count as
+        High). Each domain's consistency ratio is computed independently — no
+        other domain's data can affect it.
       </p>
       {domains.map((d) => {
         const ids = d.criteria.map((c) => c.id);
         const matrix = buildMatrix(ids, d.comparisons);
         const analysis = analyzeMatrix(matrix);
         return (
-          <div className="card domain-block" key={d.id}>
-            <h3>{d.name}</h3>
+          <div className="card domain-block" key={d.id} style={{ borderLeftColor: d.color }}>
+            <h3>
+              <Dot color={d.color} />
+              {d.name}
+            </h3>
             {d.criteria.length === 1 ? (
               <p className="inline-note">
                 Single criterion — domain-internal weight is fixed at 1.0000; no
@@ -472,7 +527,9 @@ function DomainComparisonStep({ domains, setDomains }) {
               <ThresholdSlider
                 key={c.id}
                 criterion={c}
-                onChange={(lowMed, medHigh) => setThresholds(d.id, c.id, lowMed, medHigh)}
+                onChange={(lowMed, medHigh, high) =>
+                  setThresholds(d.id, c.id, lowMed, medHigh, high)
+                }
               />
             ))}
           </div>
@@ -519,7 +576,7 @@ function LensMappingStep({
 
   return (
     <section>
-      <h2>3 · Define &amp; Map Lenses</h2>
+      <h2>3 · Domains → Lenses</h2>
       <p className="step-note">
         Lenses are the board-level perspectives leadership will weigh in Step 4.
         Assign each domain to exactly one lens (a domain cannot split across
@@ -563,7 +620,10 @@ function LensMappingStep({
             <tbody>
               {domains.map((d) => (
                 <tr key={d.id}>
-                  <td>{d.name}</td>
+                  <td>
+                    <Dot color={d.color} />
+                    {d.name}
+                  </td>
                   <td>
                     <select
                       aria-label={`Lens assignment for ${d.name}`}
@@ -600,6 +660,7 @@ function LensMappingStep({
                 ) : (
                   mapped.map((d) => (
                     <span className="lens-group-domain" key={d.id}>
+                      <Dot color={d.color} />
                       {d.name}
                     </span>
                   ))
@@ -674,20 +735,24 @@ function LeadershipStep({ lenses, lensComparisons, setLensComparisons }) {
 /* -------------------------------------------------------------- step 5 UI */
 
 const COLUMNS = [
-  { key: 'domainName', label: 'Domain' },
-  { key: 'criterionName', label: 'Criterion' },
-  { key: 'domainWeight', label: 'Domain-Internal Weight' },
-  { key: 'lensName', label: 'Mapped Lens' },
-  { key: 'lensWeight', label: 'Lens Weight' },
-  { key: 'raw', label: 'Composite (raw)' },
-  { key: 'normalized', label: 'Composite (normalized)' },
-  { key: 'lowMed', label: 'Low/Med Threshold' },
-  { key: 'medHigh', label: 'Med/High Threshold' },
+  { key: 'domainName', label: 'Domain', width: 125 },
+  { key: 'criterionName', label: 'Criterion', width: 125 },
+  { key: 'domainWeight', label: 'Domain-Internal Weight', width: 105 },
+  { key: 'lensName', label: 'Mapped Lens', width: 125 },
+  { key: 'lensWeight', label: 'Lens Weight', width: 90 },
+  { key: 'raw', label: 'Composite (raw)', width: 100 },
+  { key: 'normalized', label: 'Composite (normalized)', width: 140 },
+  { key: 'lowMed', label: 'Low/Med Threshold', width: 90 },
+  { key: 'medHigh', label: 'Med/High Threshold', width: 90 },
+  { key: 'high', label: 'High Upper Boundary', width: 90 },
 ];
+const DEFAULT_WIDTHS = Object.fromEntries(COLUMNS.map((c) => [c.key, c.width]));
+const MIN_COL_WIDTH = 64;
 
 function ResultsStep({ rows, warnings }) {
   const [sort, setSort] = useState({ key: 'normalized', dir: 'desc' });
   const [copied, setCopied] = useState(false);
+  const [colWidths, setColWidths] = useState(DEFAULT_WIDTHS);
 
   const sorted = useMemo(() => {
     const list = [...rows];
@@ -710,6 +775,26 @@ function ResultsStep({ rows, warnings }) {
       s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'desc' },
     );
 
+  const startResize = (e, key) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = colWidths[key];
+    const move = (ev) =>
+      setColWidths((w) => ({
+        ...w,
+        [key]: Math.max(MIN_COL_WIDTH, startW + ev.clientX - startX),
+      }));
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+  const resetWidth = (key) =>
+    setColWidths((w) => ({ ...w, [key]: DEFAULT_WIDTHS[key] }));
+  const tableWidth = COLUMNS.reduce((s, c) => s + colWidths[c.key], 0);
+
   const exportRows = () =>
     sorted.map((r) => [
       r.domainName,
@@ -721,6 +806,7 @@ function ResultsStep({ rows, warnings }) {
       fmt(r.normalized),
       r.lowMed.toFixed(1),
       r.medHigh.toFixed(1),
+      r.high.toFixed(1),
     ]);
 
   const copyTable = async () => {
@@ -754,7 +840,14 @@ function ResultsStep({ rows, warnings }) {
     .map((r) => ({
       name: `${r.domainName} · ${r.criterionName}`,
       value: r.normalized,
+      color: r.color,
     }));
+  const legendDomains = [];
+  for (const r of rows) {
+    if (r.normalized !== undefined && !legendDomains.some((d) => d.name === r.domainName)) {
+      legendDomains.push({ name: r.domainName, color: r.color });
+    }
+  }
   const normalizedSum = rows.reduce((s, r) => s + (r.normalized ?? 0), 0);
 
   return (
@@ -763,8 +856,9 @@ function ResultsStep({ rows, warnings }) {
       <p className="step-note">
         The hand-off deliverable: one row per criterion with its
         domain-internal weight, its lens's leadership weight, the composite of
-        the two (raw and normalized), and its Low/Medium/High breakpoints on
-        the shared 1–10 scale. Click a column header to sort.
+        the two (raw and normalized), and its threshold boundaries on the
+        shared 1–10 scale. Click a column header to sort; drag a header's right
+        edge to resize (double-click the edge to reset).
       </p>
       {warnings.map((w, i) => (
         <div key={i} className={`banner ${w.tier === 'lens' ? 'banner-lens' : 'banner-domain'}`}>
@@ -780,15 +874,25 @@ function ResultsStep({ rows, warnings }) {
         </button>
       </div>
       <div className="table-scroll">
-        <table className="results-table">
+        <table
+          className="results-table"
+          style={{ tableLayout: 'fixed', width: tableWidth }}
+        >
           <thead>
             <tr>
               {COLUMNS.map((c) => (
-                <th key={c.key}>
+                <th key={c.key} style={{ width: colWidths[c.key] }}>
                   <button className="sort-btn" onClick={() => toggleSort(c.key)}>
                     {c.label}
                     {sort.key === c.key ? (sort.dir === 'desc' ? ' ▼' : ' ▲') : ''}
                   </button>
+                  <span
+                    className="col-resize"
+                    role="separator"
+                    aria-label={`Resize ${c.label} column`}
+                    onPointerDown={(e) => startResize(e, c.key)}
+                    onDoubleClick={() => resetWidth(c.key)}
+                  />
                 </th>
               ))}
             </tr>
@@ -796,7 +900,10 @@ function ResultsStep({ rows, warnings }) {
           <tbody>
             {sorted.map((r) => (
               <tr key={r.criterionId}>
-                <td>{r.domainName}</td>
+                <td>
+                  <Dot color={r.color} />
+                  {r.domainName}
+                </td>
                 <td>{r.criterionName}</td>
                 <td className="num">{fmt(r.domainWeight)}</td>
                 <td>{r.lensName ?? '— unmapped —'}</td>
@@ -810,6 +917,7 @@ function ResultsStep({ rows, warnings }) {
                 </td>
                 <td className="num">{r.lowMed.toFixed(1)}</td>
                 <td className="num">{r.medHigh.toFixed(1)}</td>
+                <td className="num">{r.high.toFixed(1)}</td>
               </tr>
             ))}
           </tbody>
@@ -819,10 +927,19 @@ function ResultsStep({ rows, warnings }) {
         Raw composite = domain-internal weight × mapped lens weight; raw values
         are relative and need not sum to 1. Normalized composite = raw ÷ sum of
         all raw composites (currently sums to {normalizedSum.toFixed(4)}).
+        Values above a criterion's High upper boundary are treated as High.
       </p>
       {chartData.length > 0 && (
         <div className="card">
           <h3>Criteria ranked by normalized composite weight</h3>
+          <div className="chart-legend" aria-label="Domain color legend">
+            {legendDomains.map((d) => (
+              <span key={d.name}>
+                <Dot color={d.color} />
+                {d.name}
+              </span>
+            ))}
+          </div>
           <ResponsiveContainer width="100%" height={Math.max(180, chartData.length * 36 + 40)}>
             <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 48, bottom: 4, left: 8 }}>
               <CartesianGrid horizontal={false} stroke="#e6eaf0" />
@@ -845,7 +962,11 @@ function ResultsStep({ rows, warnings }) {
                 formatter={(v) => [`${(v * 100).toFixed(2)}%`, 'Normalized composite weight']}
                 cursor={{ fill: 'rgba(37, 99, 235, 0.06)' }}
               />
-              <Bar dataKey="value" fill="#2563eb" barSize={16} radius={[0, 4, 4, 0]} />
+              <Bar dataKey="value" barSize={16} radius={[0, 4, 4, 0]}>
+                {chartData.map((entry) => (
+                  <Cell key={entry.name} fill={entry.color} />
+                ))}
+              </Bar>
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -858,8 +979,8 @@ function ResultsStep({ rows, warnings }) {
 
 const STEPS = [
   'Domains & Criteria',
-  'Domain Comparison',
-  'Lenses & Mapping',
+  'Criteria Comparison',
+  'Domains → Lenses',
   'Leadership Comparison',
   'Results',
 ];
@@ -869,8 +990,48 @@ export default function WeightingTool() {
   const [domains, setDomains] = useState(initial.domains);
   const [lenses, setLenses] = useState(initial.lenses);
   const [mapping, setMapping] = useState(initial.mapping);
-  const [lensComparisons, setLensComparisons] = useState({});
+  const [lensComparisons, setLensComparisons] = useState(initial.lensComparisons);
   const [step, setStep] = useState(0);
+  const [importError, setImportError] = useState('');
+  const fileInputRef = useRef(null);
+
+  const applyProject = (state) => {
+    setDomains(state.domains);
+    setLenses(state.lenses);
+    setMapping(state.mapping);
+    setLensComparisons(state.lensComparisons);
+    setImportError('');
+  };
+
+  const exportProject = () => {
+    const json = serializeProject({ domains, lenses, mapping, lensComparisons });
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `weighting-project-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importProject = async (file) => {
+    if (!file) return;
+    try {
+      applyProject(parseProject(await file.text()));
+    } catch (err) {
+      setImportError(`Import failed: ${err.message}`);
+    }
+  };
+
+  const loadSample = () => {
+    if (
+      window.confirm(
+        'Replace the current project with the built-in sample project? Unsaved work will be lost.',
+      )
+    ) {
+      applyProject(sampleProject());
+    }
+  };
 
   const domainAnalyses = useMemo(() => {
     const out = {};
@@ -902,10 +1063,12 @@ export default function WeightingTool() {
       return {
         ...r,
         domainName: domain.name,
+        color: domain.color,
         criterionName: criterion.name,
         lensName: r.lensId ? lensById[r.lensId]?.name : undefined,
         lowMed: criterion.lowMed,
         medHigh: criterion.medHigh,
+        high: criterion.high,
       };
     });
   }, [domains, lenses, mapping, domainAnalyses, lensAnalysis]);
@@ -972,6 +1135,33 @@ export default function WeightingTool() {
           domain-level pairwise comparison, board-level lens prioritization,
           and a composite weight table ready for spatial-overlay hand-off.
         </p>
+        <div className="project-bar">
+          <button className="btn-secondary" onClick={exportProject}>
+            Export project
+          </button>
+          <button className="btn-secondary" onClick={() => fileInputRef.current?.click()}>
+            Import project
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            aria-label="Import project file"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              importProject(e.target.files?.[0]);
+              e.target.value = '';
+            }}
+          />
+          <button className="btn-secondary" onClick={loadSample}>
+            Load sample project
+          </button>
+          {importError && (
+            <span className="import-error" role="alert">
+              {importError}
+            </span>
+          )}
+        </div>
       </header>
       <nav className="step-nav" aria-label="Workflow steps">
         {STEPS.map((label, i) => (
@@ -995,7 +1185,7 @@ export default function WeightingTool() {
             lenses={lenses}
           />
         )}
-        {step === 1 && <DomainComparisonStep domains={domains} setDomains={setDomains} />}
+        {step === 1 && <CriteriaComparisonStep domains={domains} setDomains={setDomains} />}
         {step === 2 && (
           <LensMappingStep
             domains={domains}
@@ -1032,7 +1222,8 @@ export default function WeightingTool() {
         <p>
           Weights: geometric-mean approximation of the principal eigenvector ·
           consistency checked independently per matrix (CR threshold 0.10) ·
-          prototype only, state is in-memory and resets on reload.
+          prototype only, state is in-memory — use Export project to save your
+          work to a file.
         </p>
       </footer>
     </div>
@@ -1064,12 +1255,20 @@ body { margin: 0; background: var(--surface); }
   line-height: 1.45;
 }
 .app-header h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.01em; }
-.app-header p { margin: 0 0 20px; color: var(--ink-2); max-width: 72ch; }
+.app-header p { margin: 0 0 12px; color: var(--ink-2); max-width: 72ch; }
 h2 { font-size: 18px; margin: 8px 0 4px; }
-h3 { font-size: 15px; margin: 0 0 10px; }
+h3 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
 h4 { font-size: 13px; margin: 18px 0 8px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.05em; }
 .step-note { color: var(--ink-2); margin: 0 0 18px; max-width: 78ch; }
 .inline-note { color: var(--ink-2); font-size: 13px; margin: 8px 0; max-width: 78ch; }
+
+.project-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }
+.import-error { color: #b4232a; font-size: 13px; font-weight: 600; }
+
+.dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+  margin-right: 7px; vertical-align: baseline; flex-shrink: 0;
+}
 
 .step-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
 .step-btn {
@@ -1089,10 +1288,19 @@ h4 { font-size: 13px; margin: 18px 0 8px; color: var(--ink-2); text-transform: u
   background: var(--card); border: 1px solid var(--line); border-radius: 10px;
   padding: 16px 18px; margin-bottom: 16px;
 }
+.domain-card { border-top: 4px solid transparent; }
 .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; margin-bottom: 16px; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-.domain-block { margin-bottom: 20px; }
+.domain-block { margin-bottom: 20px; border-left: 4px solid transparent; }
+
+.swatch-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.swatch {
+  width: 22px; height: 22px; border-radius: 6px; border: 2px solid transparent;
+  padding: 0; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.08);
+}
+.swatch.selected { border-color: var(--ink); box-shadow: 0 0 0 2px #fff inset; }
+.swatch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .name-input {
   font: inherit; color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
@@ -1177,10 +1385,14 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   display: flex; border-radius: 6px; overflow: hidden; border: 1px solid var(--line);
 }
 .band > div { display: flex; align-items: center; justify-content: center; }
-.band span { font-size: 11px; font-weight: 700; }
+.band span { font-size: 11px; font-weight: 700; white-space: nowrap; }
 .band-low { background: #dbe9fd; color: #1e4ea8; }
 .band-med { background: #93bdf5; color: #12336e; }
 .band-high { background: #2563eb; color: #ffffff; }
+.band-cap {
+  background: repeating-linear-gradient(45deg, #eef1f6, #eef1f6 5px, #dde3ec 5px, #dde3ec 10px);
+  color: var(--ink-2);
+}
 .dual-slider input[type=range] {
   position: absolute; top: 0; left: 0; width: 100%; height: 34px; margin: 0;
   -webkit-appearance: none; appearance: none; background: none; pointer-events: none;
@@ -1210,21 +1422,31 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 .lens-group-domain {
   font-size: 13px; background: var(--surface); border: 1px solid var(--line);
-  padding: 4px 10px; border-radius: 99px;
+  padding: 4px 10px; border-radius: 99px; display: inline-flex; align-items: center;
 }
 .lens-group-empty { font-size: 13px; color: var(--ink-3); font-style: italic; }
 .lens-group-note { font-size: 12px; color: #8a5a13; }
 
 .results-actions { display: flex; gap: 10px; margin-bottom: 12px; }
-.results-table th { background: var(--surface); padding: 0; }
+.results-table th { background: var(--surface); padding: 0; position: relative; }
 .sort-btn {
   background: none; border: none; font: inherit; font-weight: 700; font-size: 12.5px;
-  color: var(--ink); padding: 8px 10px; width: 100%; text-align: left; white-space: nowrap;
+  color: var(--ink); padding: 8px 10px; width: 100%; text-align: left;
+  white-space: normal; line-height: 1.25;
 }
 .sort-btn:hover { color: var(--accent-dark); }
+.col-resize {
+  position: absolute; top: 0; right: -4px; width: 9px; height: 100%;
+  cursor: col-resize; z-index: 2; touch-action: none;
+}
+.col-resize:hover { background: rgba(37, 99, 235, 0.25); }
 .results-table { margin-bottom: 10px; }
-.results-table td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.results-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.results-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .results-table .pct { color: var(--ink-3); font-size: 12px; }
+
+.chart-legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; font-size: 13px; color: var(--ink-2); }
+.chart-legend > span { display: inline-flex; align-items: center; }
 
 .app-footer { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 14px; }
 .footer-nav { display: flex; justify-content: space-between; margin-bottom: 12px; }
